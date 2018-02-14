@@ -31,6 +31,8 @@ import Kernel.Name
 import Kernel.Level
 import Kernel.Expr
 
+import qualified Kernel.EquivManager as EM
+
 {- Inductive extension -}
 
 data IntroRule = IntroRule Name Expr deriving (Show)
@@ -162,7 +164,8 @@ makeLenses ''TypeCheckerR
 data TypeCheckerS = TypeCheckerS {
   _tcsNextId :: Integer,
   _tcsInferTypeCache :: Map Expr Expr,
-  _tcsWhnfCache :: Map Expr Expr
+  _tcsWhnfCache :: Map Expr Expr,
+  _tcsEquivManager :: EM.EquivManager
   }
 
 makeLenses ''TypeCheckerS
@@ -171,7 +174,7 @@ mkTypeCheckerR :: Env -> [Name] -> TypeCheckerR
 mkTypeCheckerR env levelParamNames  = TypeCheckerR env levelParamNames
 
 mkTypeCheckerS :: Integer -> TypeCheckerS
-mkTypeCheckerS nextId = TypeCheckerS nextId Map.empty Map.empty
+mkTypeCheckerS nextId = TypeCheckerS nextId Map.empty Map.empty EM.empty_equiv_manager
 
 type TCMethod = ExceptT TypeError (StateT TypeCheckerS (Reader TypeCheckerR))
 
@@ -401,10 +404,18 @@ gensym = tcsNextId %%= \n -> (n, n + 1)
 
 isDefEq :: Expr -> Expr -> TCMethod Bool
 isDefEq t s = {-# SCC "isDefEq" #-} do
-  success <- runExceptT (isDefEqCore t s)
+  success <- runExceptT (isDefEqMain t s)
   case success of
     Left answer -> return answer
     Right () -> return False
+
+isDefEqMain :: Expr -> Expr -> DefEqMethod ()
+isDefEqMain t s = do
+  success <- lift $ runExceptT (isDefEqCore t s)
+  case success of
+    Left True -> em_add_equiv t s >> throwE True
+    Left False -> throwE False
+    Right () -> return ()
 
 -- | If 'deqFn' short-circuits, then 'deqCommitTo deqFn' short-circuits with the same value, otherwise it shortcircuits with False.
 deqCommitTo :: DefEqMethod () -> DefEqMethod ()
@@ -558,6 +569,7 @@ isDefEqProofIrrel t s = do
 
 quickIsDefEq :: Expr -> Expr -> DefEqMethod ()
 quickIsDefEq t s = do
+  em_is_equiv t s
   case (t, s) of
     (Lambda lam1, Lambda lam2) -> deqCommitTo (isDefEqBinding lam1 lam2)
     (Pi pi1, Pi pi2) -> deqCommitTo (isDefEqBinding pi1 pi2)
@@ -683,6 +695,20 @@ quotientNormExt e = do
       quotLift = mkName ["quot","lift"]
       quotInd = mkName ["quot","ind"]
       quotMk = mkName ["quot","mk"]
+
+{- caching for is_def_eq -}
+
+em_add_equiv :: Expr -> Expr -> DefEqMethod ()
+em_add_equiv e1 e2 = do
+  eqv <- gets _tcsEquivManager
+  modify (\tc -> tc { _tcsEquivManager = EM.add_equiv e1 e2 eqv })
+
+em_is_equiv :: Expr -> Expr -> DefEqMethod ()
+em_is_equiv e1 e2 = do
+  eqv <- gets _tcsEquivManager
+  let (is_equiv,new_eqv) = EM.is_equiv e1 e2 eqv in do
+    modify (\tc -> tc { _tcsEquivManager = new_eqv })
+    if is_equiv then throwE True else return ()
 
 {- Adding to the environment -}
 
